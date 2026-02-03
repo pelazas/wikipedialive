@@ -76,6 +76,46 @@ export default {
 
     console.log(`[ENRICHED:${requestId}]`, enriched);
 
+    // Insert into Supabase if configured
+    try {
+      if (!env.SUPABASE_URL || !env.SUPABASE_SERVICE_ROLE_KEY) {
+        throw new Error("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY");
+      }
+
+      const row = {
+        request_id: payload?.request_id || null,
+        title: payload?.title || null,
+        url: payload?.url || null,
+        username: payload?.user || null,
+        comment: payload?.comment || null,
+        change_size: payload?.change_size ?? null,
+        timestamp: payload?.timestamp ?? null,
+        category: classResult?.category ?? null,
+        lat: geoResult?.lat ?? null,
+        lon: geoResult?.lon ?? null,
+        country: geoResult?.country ?? null,
+        raw: payload
+      };
+
+      const insertResponse = await fetch(`${env.SUPABASE_URL}/rest/v1/edits`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+          Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+          Prefer: "return=minimal"
+        },
+        body: JSON.stringify(row)
+      });
+
+      if (!insertResponse.ok) {
+        const errorText = await insertResponse.text();
+        console.log(`[SUPABASE:${requestId}] Insert failed ${insertResponse.status}: ${errorText}`);
+      }
+    } catch (err) {
+      console.log(`[SUPABASE:${requestId}] Insert error: ${String(err)}`);
+    }
+
     return new Response(JSON.stringify(enriched), {
       headers: { "content-type": "application/json" }
     });
