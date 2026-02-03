@@ -1,13 +1,22 @@
 services:
+  worker:
+    build:
+      context: ./worker
+    environment:
+      - CLOUDFLARE_API_TOKEN=${CLOUDFLARE_API_TOKEN}
+      - CLOUDFLARE_ACCOUNT_ID=${CLOUDFLARE_ACCOUNT_ID}
+    ports:
+      - "8787:8787"
+    restart: unless-stopped
+
   ingestion:
     build:
       context: ./ingestion
+    environment:
+      - INGEST_URL=http://worker:8787/ingest
+    depends_on:
+      - worker
     restart: unless-stopped
-
-  # TODO: Add worker service (Cloudflare Workers are typically deployed, not run in compose)
-  # worker:
-  #   build:
-  #     context: ./worker
 
   # TODO: Add frontend service
   # frontend:

@@ -1,14 +1,15 @@
 import json
 import os
+import uuid
 import requests
 from sseclient import SSEClient
 
 # URL for the Wikimedia recent changes stream
 STREAM_URL = 'https://stream.wikimedia.org/v2/stream/recentchange'
-INGEST_URL = os.getenv("INGEST_URL", "http://localhost:8787/ingest")
+INGEST_URL = os.getenv("INGEST_URL", "http://worker:8787/ingest")
 
 # Constraints
-MIN_CHAR_CHANGE = 500  # Only care if they changed significant text (per README)
+MIN_CHAR_CHANGE = 1000  # Only care if they changed significant text
 WIKI_DB = 'enwiki'     # Focus on English Wikipedia for now (easier for AI)
 
 
@@ -64,7 +65,9 @@ def process_stream():
 
             if filter_event(event_data):
                 # This is a CANDIDATE for our AI
+                request_id = str(uuid.uuid4())
                 payload = {
+                    "request_id": request_id,
                     "title": event_data.get('title', ''),
                     "url": event_data.get('meta', {}).get('uri', ''),
                     "user": event_data.get('user', ''),
@@ -76,9 +79,17 @@ def process_stream():
 
                 # Send to local receiver (or Cloudflare Worker later)
                 try:
-                    requests.post(INGEST_URL, json=payload, timeout=5)
+                    response = requests.post(INGEST_URL, json=payload, timeout=10)
+                    if response.ok:
+                        try:
+                            enriched = response.json()
+                            print(f"[ENRICHED:{request_id}]", enriched)
+                        except ValueError:
+                            print(f"[ENRICHED:{request_id}] (non-JSON response)")
+                    else:
+                        print(f"[ENRICHED:{request_id}] Worker responded with {response.status_code}: {response.text}")
                 except Exception as e:
-                    print(f"Error sending to ingest endpoint: {e}")
+                    print(f"[ENRICHED:{request_id}] Error sending to ingest endpoint: {e}")
 
                 print(f"[CANDIDATE] {payload['title']} | Change: {payload['change_size']} chars")
                 print(f"   > Comment: {payload['comment']}\n")
