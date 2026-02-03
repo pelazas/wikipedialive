@@ -1,0 +1,15 @@
+services:
+  ingestion:
+    build:
+      context: ./ingestion
+    restart: unless-stopped
+
+  # TODO: Add worker service (Cloudflare Workers are typically deployed, not run in compose)
+  # worker:
+  #   build:
+  #     context: ./worker
+
+  # TODO: Add frontend service
+  # frontend:
+  #   build:
+  #     context: ./frontend
