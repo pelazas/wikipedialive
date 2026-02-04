@@ -68,8 +68,12 @@ export default {
       classResult = { category: null, error: String(err) };
     }
 
+    const qualityScore = Math.abs(payload?.change_size ?? 0);
+    const qualityMin = Number(env.QUALITY_SCORE_MIN || 3000);
+
     const enriched = {
       ...payload,
+      quality_score: qualityScore,
       geo: geoResult,
       classification: classResult
     };
@@ -80,6 +84,13 @@ export default {
     try {
       if (!env.SUPABASE_URL || !env.SUPABASE_SERVICE_ROLE_KEY) {
         throw new Error("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY");
+      }
+
+      if (qualityScore < qualityMin) {
+        console.log(`[SUPABASE:${requestId}] Skipping insert (quality_score ${qualityScore} < ${qualityMin})`);
+        return new Response(JSON.stringify(enriched), {
+          headers: { "content-type": "application/json" }
+        });
       }
 
       const row = {
@@ -94,6 +105,7 @@ export default {
         lat: geoResult?.lat ?? null,
         lon: geoResult?.lon ?? null,
         country: geoResult?.country ?? null,
+        quality_score: qualityScore,
         raw: payload
       };
 

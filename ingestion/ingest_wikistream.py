@@ -9,8 +9,28 @@ STREAM_URL = 'https://stream.wikimedia.org/v2/stream/recentchange'
 INGEST_URL = os.getenv("INGEST_URL", "http://worker:8787/ingest")
 
 # Constraints
-MIN_CHAR_CHANGE = 1000  # Only care if they changed significant text
+MIN_CHAR_CHANGE = int(os.getenv("MIN_CHAR_CHANGE", "3000"))  # Only care if they changed significant text
 WIKI_DB = 'enwiki'     # Focus on English Wikipedia for now (easier for AI)
+MAIN_NAMESPACE_ID = 0  # Only keep main/article namespace
+NON_ARTICLE_PREFIXES = (
+    "User:",
+    "User talk:",
+    "Talk:",
+    "Template:",
+    "Draft:",
+    "Wikipedia:",
+    "Category:",
+    "File:",
+    "MediaWiki:",
+    "Help:",
+    "Portal:",
+    "Module:",
+    "Book:",
+    "TimedText:",
+    "Education Program:",
+    "Gadget:",
+    "Gadget definition:",
+)
 
 
 def filter_event(event_data):
@@ -25,11 +45,31 @@ def filter_event(event_data):
     if event_data.get('type') not in ['edit', 'new']:
         return False
 
-    # 3. Must be the target language
+    # 3. Skip minor edits
+    if event_data.get('minor') is True:
+        return False
+
+    # 4. Must be the target language
     if event_data.get('wiki') != WIKI_DB:
         return False
 
-    # 4. Significance Check (Length difference)
+    # 5. Only keep main/article namespace
+    namespace = event_data.get('namespace', {})
+    if isinstance(namespace, dict):
+        ns_id = namespace.get('id')
+    elif isinstance(namespace, int):
+        ns_id = namespace
+    else:
+        ns_id = None
+
+    if ns_id is not None and ns_id != MAIN_NAMESPACE_ID:
+        return False
+
+    title = event_data.get('title', '')
+    if any(title.startswith(prefix) for prefix in NON_ARTICLE_PREFIXES):
+        return False
+
+    # 6. Significance Check (Length difference)
     # We use abs() because a massive deletion is also interesting!
     length_new = event_data.get('length', {}).get('new', 0)
     length_old = event_data.get('length', {}).get('old', 0)

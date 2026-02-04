@@ -7,6 +7,7 @@ services:
       - CLOUDFLARE_ACCOUNT_ID=${CLOUDFLARE_ACCOUNT_ID}
       - SUPABASE_URL=${SUPABASE_URL}
       - SUPABASE_SERVICE_ROLE_KEY=${SUPABASE_SERVICE_ROLE_KEY}
+      - QUALITY_SCORE_MIN=${QUALITY_SCORE_MIN}
     ports:
       - "8787:8787"
     restart: unless-stopped
