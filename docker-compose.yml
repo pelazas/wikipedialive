@@ -21,7 +21,14 @@ services:
       - worker
     restart: unless-stopped
 
-  # TODO: Add frontend service
-  # frontend:
-  #   build:
-  #     context: ./frontend
+  frontend:
+    build:
+      context: ./frontend
+    environment:
+      - VITE_SUPABASE_URL=${SUPABASE_URL}
+      - VITE_SUPABASE_ANON_KEY=${SUPABASE_ANON_KEY}
+    ports:
+      - "5173:5173"
+    depends_on:
+      - worker
+    restart: unless-stopped

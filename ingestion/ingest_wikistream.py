@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import time
 import uuid
 import requests
@@ -10,10 +11,15 @@ STREAM_URL = 'https://stream.wikimedia.org/v2/stream/recentchange'
 INGEST_URL = os.getenv("INGEST_URL", "http://worker:8787/ingest")
 
 # Constraints
-MIN_CHAR_CHANGE = int(os.getenv("MIN_CHAR_CHANGE", "3000"))  # Only care if they changed significant text
+MIN_CHAR_CHANGE = int(os.getenv("MIN_CHAR_CHANGE", "5000"))  # Stricter default to cut low-signal AI calls
 LOG_EVERY_N = max(1, int(os.getenv("LOG_EVERY_N", "100")))
-WIKI_DB = 'enwiki'     # Focus on English Wikipedia for now (easier for AI)
-MAIN_NAMESPACE_ID = 0  # Only keep main/article namespace
+SUMMARY_HEARTBEAT_EVERY_N = max(1, int(os.getenv("SUMMARY_HEARTBEAT_EVERY_N", "5000")))
+ALLOWED_WIKIS = {w.strip() for w in os.getenv("ALLOWED_WIKIS", "enwiki").split(",") if w.strip()}
+ALLOWED_NAMESPACE_IDS = {
+    int(ns.strip())
+    for ns in os.getenv("ALLOWED_NAMESPACE_IDS", "0").split(",")
+    if ns.strip()
+}
 NON_ARTICLE_PREFIXES = (
     "User:",
     "User talk:",
@@ -33,6 +39,18 @@ NON_ARTICLE_PREFIXES = (
     "Gadget:",
     "Gadget definition:",
 )
+LOW_SIGNAL_COMMENT_PATTERNS = [
+    r"\btypo(s)?\b",
+    r"\bformat(ting)?\b",
+    r"\bcopy\s*edit(ing)?\b",
+    r"\bgrammar\b",
+    r"\bspelling\b",
+    r"\bpunctuation\b",
+    r"\bwhitespace\b",
+    r"\bcapitali[sz]ation\b",
+    r"\b(rv|revert(ed)?)\b",
+]
+LOW_SIGNAL_COMMENT_RE = re.compile("|".join(LOW_SIGNAL_COMMENT_PATTERNS), re.IGNORECASE)
 
 
 def build_payload(event_data, request_id):
@@ -88,11 +106,11 @@ def filter_event(event_data):
     if event_data.get('minor') is True:
         return False
 
-    # 4. Must be the target language
-    if event_data.get('wiki') != WIKI_DB:
+    # 4. Must be one of the target wikis/languages
+    if event_data.get('wiki') not in ALLOWED_WIKIS:
         return False
 
-    # 5. Only keep main/article namespace
+    # 5. Keep only selected namespaces
     namespace = event_data.get('namespace', {})
     if isinstance(namespace, dict):
         ns_id = namespace.get('id')
@@ -101,14 +119,19 @@ def filter_event(event_data):
     else:
         ns_id = None
 
-    if ns_id is not None and ns_id != MAIN_NAMESPACE_ID:
+    if ns_id is None or ns_id not in ALLOWED_NAMESPACE_IDS:
         return False
 
     title = event_data.get('title', '')
     if any(title.startswith(prefix) for prefix in NON_ARTICLE_PREFIXES):
         return False
 
-    # 6. Significance Check (Length difference)
+    # 6. Exclude low-signal edit comments before AI enrichment
+    comment = event_data.get('comment')
+    if isinstance(comment, str) and LOW_SIGNAL_COMMENT_RE.search(comment):
+        return False
+
+    # 7. Significance Check (Length difference)
     # We use abs() because a massive deletion is also interesting!
     length_new = event_data.get('length', {}).get('new', 0)
     length_old = event_data.get('length', {}).get('old', 0)
@@ -132,6 +155,26 @@ def log_summary(counters):
     )
 
 
+def summary_change_key(counters):
+    return (
+        counters["enriched_ok"],
+        counters["enriched_failed"],
+        counters["db_insert_ok"],
+        counters["db_insert_failed"],
+    )
+
+
+def maybe_log_summary(counters, summary_state, force=False):
+    if not force and counters["seen"] % LOG_EVERY_N != 0:
+        return
+
+    changed = summary_change_key(counters) != summary_state["last_change_key"]
+    heartbeat = counters["seen"] % SUMMARY_HEARTBEAT_EVERY_N == 0
+    if force or changed or heartbeat:
+        log_summary(counters)
+        summary_state["last_change_key"] = summary_change_key(counters)
+
+
 def process_stream():
     print(f"Listening to {STREAM_URL}...")
     reconnect_delay_seconds = 2
@@ -142,6 +185,9 @@ def process_stream():
         "enriched_failed": 0,
         "db_insert_ok": 0,
         "db_insert_failed": 0,
+    }
+    summary_state = {
+        "last_change_key": (-1, -1, -1, -1)
     }
 
     while True:
@@ -169,8 +215,6 @@ def process_stream():
 
                     if not filter_event(event_data):
                         counters["filtered"] += 1
-                        if counters["seen"] % LOG_EVERY_N == 0:
-                            log_summary(counters)
                         continue
 
                     # This is a CANDIDATE for our AI
@@ -179,8 +223,6 @@ def process_stream():
                     if payload is None:
                         counters["enriched_failed"] += 1
                         print(f"[ENRICHED:{request_id}] Skipping event due to payload contract mismatch")
-                        if counters["seen"] % LOG_EVERY_N == 0:
-                            log_summary(counters)
                         continue
 
                     # Send to local receiver (or Cloudflare Worker later)
@@ -209,20 +251,18 @@ def process_stream():
 
                     print(f"[CANDIDATE] {payload['title']} | Change: {payload['change_size']} chars")
                     print(f"   > Comment: {payload['comment']}\n")
-                    if counters["seen"] % LOG_EVERY_N == 0:
-                        log_summary(counters)
 
                 except json.JSONDecodeError:
-                    if counters["seen"] % LOG_EVERY_N == 0:
-                        log_summary(counters)
+                    pass
                 except Exception as e:
                     counters["enriched_failed"] += 1
                     print(f"Error processing event: {e}")
-                    if counters["seen"] % LOG_EVERY_N == 0:
-                        log_summary(counters)
+                finally:
+                    maybe_log_summary(counters, summary_state)
 
         except requests.exceptions.RequestException as e:
             print(f"Stream connection error: {e}. Reconnecting in {reconnect_delay_seconds}s...")
+            maybe_log_summary(counters, summary_state, force=True)
             time.sleep(reconnect_delay_seconds)
         finally:
             if stream_response is not None:
