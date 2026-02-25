@@ -1,204 +1,109 @@
-export const ANALYTICS_WINDOW_MS = 5 * 60 * 1000;
-export const ANALYTICS_REFRESH_MS = 10 * 1000;
+const MINUTE_MS = 60 * 1000;
 
-function parseNumeric(value) {
+function toEpochMs(value) {
   if (typeof value === "number" && Number.isFinite(value)) {
-    return value;
+    if (value > 1_000_000_000_000) {
+      return value;
+    }
+    if (value > 0) {
+      return value * 1000;
+    }
   }
-  if (typeof value === "string" && value.trim() !== "") {
-    const parsed = Number(value);
-    if (Number.isFinite(parsed)) {
+
+  if (typeof value === "string" && value.trim()) {
+    const parsed = Date.parse(value);
+    if (!Number.isNaN(parsed)) {
       return parsed;
     }
   }
-  return null;
-}
-
-export function toUnixMs(value) {
-  if (value == null) {
-    return null;
-  }
-
-  if (typeof value === "number" && Number.isFinite(value)) {
-    // Heuristic: values below 1e12 are treated as seconds.
-    return value < 1_000_000_000_000 ? value * 1000 : value;
-  }
-
-  if (typeof value === "string") {
-    const asNumber = Number(value);
-    if (Number.isFinite(asNumber)) {
-      return asNumber < 1_000_000_000_000 ? asNumber * 1000 : asNumber;
-    }
-    const parsed = Date.parse(value);
-    return Number.isFinite(parsed) ? parsed : null;
-  }
 
   return null;
 }
 
-export function editTimestampMs(edit) {
-  return (
-    toUnixMs(edit?.created_at) ??
-    toUnixMs(edit?.timestamp) ??
-    toUnixMs(edit?.event_time) ??
-    null
-  );
+export function eventTimeMs(event) {
+  return toEpochMs(event?.timestamp) ?? toEpochMs(event?.created_at);
 }
 
-export function selectActiveWindowEdits(edits, nowMs, windowMs = ANALYTICS_WINDOW_MS) {
-  const cutoff = nowMs - windowMs;
-  return (Array.isArray(edits) ? edits : []).filter((edit) => {
-    const ts = editTimestampMs(edit);
-    return typeof ts === "number" && ts >= cutoff && ts <= nowMs;
-  });
-}
-
-export function computeEventsPerMinute(edits, windowMs = ANALYTICS_WINDOW_MS) {
-  if (windowMs <= 0) {
-    return 0;
+export function inLastWindow(event, nowMs, windowMinutes) {
+  const time = eventTimeMs(event);
+  if (!time) {
+    return false;
   }
-  const count = Array.isArray(edits) ? edits.length : 0;
-  return count / (windowMs / 60_000);
+  return time >= nowMs - windowMinutes * MINUTE_MS && time <= nowMs;
 }
 
-export function computeClassifiedPercent(edits) {
-  const rows = Array.isArray(edits) ? edits : [];
-  if (rows.length === 0) {
-    return 0;
+export function buildTopicCounts(events, nowMs, windowMinutes = 60) {
+  const counts = new Map();
+  for (const event of events) {
+    if (!inLastWindow(event, nowMs, windowMinutes)) {
+      continue;
+    }
+    const category = event?.category || "Other";
+    counts.set(category, (counts.get(category) || 0) + 1);
   }
-  const classified = rows.filter((edit) => {
-    const value = edit?.category;
-    return typeof value === "string" && value.trim() !== "";
-  }).length;
-  return (classified / rows.length) * 100;
+  return counts;
 }
 
-export function computeAverageAbsoluteChangeSize(edits) {
-  const rows = (Array.isArray(edits) ? edits : [])
-    .map((edit) => parseNumeric(edit?.change_size))
-    .filter((value) => typeof value === "number");
+export function buildCountryHeatRows(events, nowMs, options = {}) {
+  const topN = options.topN ?? 5;
+  const activeWindowMin = options.activeWindowMin ?? 60;
+  const shortWindowMin = options.shortWindowMin ?? 5;
+  const baselineWindowMin = options.baselineWindowMin ?? 30;
+  const multiplier = options.multiplier ?? 2;
+  const minShortCount = options.minShortCount ?? 3;
 
-  if (rows.length === 0) {
-    return 0;
-  }
+  const activeStart = nowMs - activeWindowMin * MINUTE_MS;
+  const shortStart = nowMs - shortWindowMin * MINUTE_MS;
+  const baselineStart = shortStart - baselineWindowMin * MINUTE_MS;
 
-  const total = rows.reduce((sum, changeSize) => sum + Math.abs(changeSize), 0);
-  return total / rows.length;
-}
+  const counts = new Map();
+  const shortCounts = new Map();
+  const baselineCounts = new Map();
 
-export function parseSummaryCounters(input) {
-  if (!input) {
-    return null;
-  }
-
-  if (typeof input === "object") {
-    const seen = parseNumeric(input.seen);
-    const filtered = parseNumeric(input.filtered);
-    const dbInsertOk = parseNumeric(input.db_insert_ok);
-    const dbInsertFailed = parseNumeric(input.db_insert_failed);
-    const enrichedOk = parseNumeric(input.enriched_ok);
-    const enrichedFailed = parseNumeric(input.enriched_failed);
-
-    const hasAny =
-      seen !== null ||
-      filtered !== null ||
-      dbInsertOk !== null ||
-      dbInsertFailed !== null ||
-      enrichedOk !== null ||
-      enrichedFailed !== null;
-
-    if (!hasAny) {
-      return null;
+  for (const event of events) {
+    const eventMs = eventTimeMs(event);
+    if (!eventMs) {
+      continue;
     }
 
-    return {
-      seen,
-      filtered,
-      db_insert_ok: dbInsertOk,
-      db_insert_failed: dbInsertFailed,
-      enriched_ok: enrichedOk,
-      enriched_failed: enrichedFailed
-    };
+    const countryRaw = event?.country;
+    const country = typeof countryRaw === "string" && countryRaw.trim() ? countryRaw.trim() : "Unknown";
+
+    if (eventMs >= activeStart && eventMs <= nowMs) {
+      counts.set(country, (counts.get(country) || 0) + 1);
+    }
+    if (eventMs >= shortStart && eventMs <= nowMs) {
+      shortCounts.set(country, (shortCounts.get(country) || 0) + 1);
+    } else if (eventMs >= baselineStart && eventMs < shortStart) {
+      baselineCounts.set(country, (baselineCounts.get(country) || 0) + 1);
+    }
   }
 
-  if (typeof input !== "string") {
-    return null;
-  }
+  const rows = Array.from(counts.entries())
+    .map(([country, count]) => {
+      const shortCount = shortCounts.get(country) || 0;
+      const baselineCount = baselineCounts.get(country) || 0;
+      const baselineNormalized = baselineCount * (shortWindowMin / baselineWindowMin);
+      const hotspot = shortCount >= minShortCount && (
+        baselineCount === 0 || shortCount > multiplier * baselineNormalized
+      );
 
-  const trimmed = input.trim();
-  if (!trimmed) {
-    return null;
-  }
+      return {
+        country,
+        count,
+        shortCount,
+        baselineCount,
+        hotspot
+      };
+    })
+    .sort((a, b) => b.count - a.count || a.country.localeCompare(b.country))
+    .slice(0, topN);
 
-  try {
-    const parsed = JSON.parse(trimmed);
-    return parseSummaryCounters(parsed);
-  } catch {
-    // Continue with key=value parser.
-  }
+  const maxCount = rows.reduce((max, row) => Math.max(max, row.count), 0);
 
-  const counters = {};
-  const re = /\b(seen|filtered|enriched_ok|enriched_failed|db_insert_ok|db_insert_failed)=(-?\d+)\b/g;
-  let match = re.exec(trimmed);
-  while (match) {
-    counters[match[1]] = Number(match[2]);
-    match = re.exec(trimmed);
-  }
-
-  return Object.keys(counters).length > 0 ? parseSummaryCounters(counters) : null;
+  return rows.map((row) => ({
+    ...row,
+    barPct: maxCount > 0 ? Math.max(6, Math.round((row.count / maxCount) * 100)) : 0
+  }));
 }
 
-export function computeFilteredPercent(summaryCounters) {
-  const counters = parseSummaryCounters(summaryCounters);
-  if (!counters) {
-    return null;
-  }
-
-  const seen = parseNumeric(counters.seen);
-  const filtered = parseNumeric(counters.filtered);
-  if (seen === null || filtered === null || seen <= 0) {
-    return null;
-  }
-
-  return (filtered / seen) * 100;
-}
-
-export function computeInsertSuccessRate(summaryCounters) {
-  const counters = parseSummaryCounters(summaryCounters);
-  if (!counters) {
-    return null;
-  }
-
-  const ok = parseNumeric(counters.db_insert_ok);
-  const failed = parseNumeric(counters.db_insert_failed);
-  if (ok === null || failed === null) {
-    return null;
-  }
-
-  const total = ok + failed;
-  if (total <= 0) {
-    return null;
-  }
-  return (ok / total) * 100;
-}
-
-export function buildAnalyticsSnapshot({
-  edits,
-  summaryCounters,
-  nowMs = Date.now(),
-  windowMs = ANALYTICS_WINDOW_MS
-}) {
-  const activeWindowEdits = selectActiveWindowEdits(edits, nowMs, windowMs);
-
-  return {
-    generatedAtMs: nowMs,
-    windowMs,
-    windowStartMs: nowMs - windowMs,
-    totalEdits: activeWindowEdits.length,
-    eventsPerMinute: computeEventsPerMinute(activeWindowEdits, windowMs),
-    classifiedPercent: computeClassifiedPercent(activeWindowEdits),
-    averageAbsoluteChangeSize: computeAverageAbsoluteChangeSize(activeWindowEdits),
-    filteredPercent: computeFilteredPercent(summaryCounters),
-    insertSuccessRate: computeInsertSuccessRate(summaryCounters)
-  };
-}

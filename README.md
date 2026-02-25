@@ -70,3 +70,15 @@ We use a Push-Pull architecture. A local Python "Feeder" pushes clean events to 
 - **Colors:** Politics (Red), Science (Blue), Sports (Green), Culture (Yellow).
 - **Animation:** When an event arrives, a "ripple" expands from the location on the globe.
 - **HUD:** A sleek overlay showing the "Live Feed" on the left and "Top Weekly Edits" at the bottom.
+
+## Frontend Analytics Rules
+
+- **Trending topic windows:** `15m` and `1h`.  
+  Each topic chip shows `count` and `delta = active_window_count - previous_equal_window_count`.
+- **Category filtering:** Clicking a topic chip filters both the live feed and globe pins. Clicking the active chip toggles back to `All`.
+- **Geography heat panel window:** Last `60m`, top 5 countries.
+- **Unknown country handling:** Empty/null country values are grouped under `Unknown`.
+- **Mini-bar scaling:** `barPct = country_count / max_country_count_in_top5 * 100`.
+- **Hotspot rule:** A country is marked `New hotspot` when:
+  - last 5-minute count is at least `3`, and
+  - last 5-minute count is greater than `2x` its previous 30-minute normalized 5-minute baseline.

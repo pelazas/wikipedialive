@@ -38,7 +38,40 @@ function Sparkline({ points }) {
   );
 }
 
-export default function MetricsBar({ metrics }) {
+function ActivityMiniChart({ buckets }) {
+  const values = Array.isArray(buckets) && buckets.length > 0 ? buckets : Array.from({ length: 30 }, () => 0);
+  const maxValue = Math.max(1, ...values);
+  const barWidth = 100 / values.length;
+  const currentMinuteCount = values[values.length - 1] || 0;
+  const totalEvents = values.reduce((sum, value) => sum + value, 0);
+
+  return (
+    <article className="metric-tile metric-tile-activity" aria-label="Event activity in last 30 minutes">
+      <small>Event activity</small>
+      <strong>{totalEvents > 0 ? `${currentMinuteCount}/min` : FALLBACK_TEXT}</strong>
+      <svg className="metric-activity-bars" viewBox="0 0 100 28" preserveAspectRatio="none" role="img" aria-hidden="true">
+        <line x1="0" y1="27.5" x2="100" y2="27.5" />
+        {values.map((value, idx) => {
+          const h = (value / maxValue) * 24;
+          const y = 27 - h;
+          return (
+            <rect
+              key={`activity-${idx}`}
+              x={idx * barWidth + 0.2}
+              y={y}
+              width={Math.max(barWidth - 0.45, 0.8)}
+              height={Math.max(h, 0)}
+              rx="0.4"
+              className={value > 0 ? "is-active" : ""}
+            />
+          );
+        })}
+      </svg>
+    </article>
+  );
+}
+
+export default function MetricsBar({ metrics, activityBuckets }) {
   return (
     <section className="metrics-bar" aria-label="Live metrics">
       <div className="metrics-grid">
@@ -49,6 +82,7 @@ export default function MetricsBar({ metrics }) {
             <Sparkline points={metric.sparkline} />
           </article>
         ))}
+        <ActivityMiniChart buckets={activityBuckets} />
       </div>
     </section>
   );
