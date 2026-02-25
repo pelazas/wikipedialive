@@ -1,5 +1,6 @@
 import json
 import os
+import time
 import uuid
 import requests
 from sseclient import SSEClient
@@ -10,6 +11,7 @@ INGEST_URL = os.getenv("INGEST_URL", "http://worker:8787/ingest")
 
 # Constraints
 MIN_CHAR_CHANGE = int(os.getenv("MIN_CHAR_CHANGE", "3000"))  # Only care if they changed significant text
+LOG_EVERY_N = max(1, int(os.getenv("LOG_EVERY_N", "100")))
 WIKI_DB = 'enwiki'     # Focus on English Wikipedia for now (easier for AI)
 MAIN_NAMESPACE_ID = 0  # Only keep main/article namespace
 NON_ARTICLE_PREFIXES = (
@@ -31,6 +33,43 @@ NON_ARTICLE_PREFIXES = (
     "Gadget:",
     "Gadget definition:",
 )
+
+
+def build_payload(event_data, request_id):
+    """
+    Build a payload that matches the worker ingress contract exactly.
+    Returns None if required fields are missing or invalid.
+    """
+    title = event_data.get('title')
+    url = event_data.get('meta', {}).get('uri')
+    user = event_data.get('user')
+    comment = event_data.get('comment', '')
+    timestamp = event_data.get('timestamp')
+    length_new = event_data.get('length', {}).get('new', 0)
+    length_old = event_data.get('length', {}).get('old', 0)
+
+    if not isinstance(title, str) or not title.strip():
+        return None
+    if not isinstance(url, str) or not url.strip():
+        return None
+    if not isinstance(user, str) or not user.strip():
+        return None
+    if not isinstance(comment, str):
+        return None
+    if not isinstance(timestamp, int) or timestamp <= 0:
+        return None
+    if not isinstance(length_new, int) or not isinstance(length_old, int):
+        return None
+
+    return {
+        "request_id": request_id,
+        "title": title,
+        "url": url,
+        "user": user,
+        "comment": comment,
+        "change_size": length_new - length_old,
+        "timestamp": timestamp
+    }
 
 
 def filter_event(event_data):
@@ -81,63 +120,113 @@ def filter_event(event_data):
     return True
 
 
+def log_summary(counters):
+    print(
+        "[SUMMARY] "
+        f"seen={counters['seen']} "
+        f"filtered={counters['filtered']} "
+        f"enriched_ok={counters['enriched_ok']} "
+        f"enriched_failed={counters['enriched_failed']} "
+        f"db_insert_ok={counters['db_insert_ok']} "
+        f"db_insert_failed={counters['db_insert_failed']}"
+    )
+
+
 def process_stream():
     print(f"Listening to {STREAM_URL}...")
+    reconnect_delay_seconds = 2
+    counters = {
+        "seen": 0,
+        "filtered": 0,
+        "enriched_ok": 0,
+        "enriched_failed": 0,
+        "db_insert_ok": 0,
+        "db_insert_failed": 0,
+    }
 
-    # Connect to the stream
-    response = requests.get(
-        STREAM_URL,
-        stream=True,
-        headers={
-            "Accept": "text/event-stream",
-            "User-Agent": "wikipedialive-ingestion/0.1 (contact: local-dev)"
-        },
-    )
-    response.raise_for_status()
-    client = SSEClient(response)
-
-    for msg in client.events():
-        if not msg.data:
-            continue
-
+    while True:
+        stream_response = None
         try:
-            event_data = json.loads(msg.data)
+            # Connect to the stream
+            stream_response = requests.get(
+                STREAM_URL,
+                stream=True,
+                headers={
+                    "Accept": "text/event-stream",
+                    "User-Agent": "wikipedialive-ingestion/0.1 (contact: local-dev)"
+                },
+            )
+            stream_response.raise_for_status()
+            client = SSEClient(stream_response)
 
-            if filter_event(event_data):
-                # This is a CANDIDATE for our AI
-                request_id = str(uuid.uuid4())
-                payload = {
-                    "request_id": request_id,
-                    "title": event_data.get('title', ''),
-                    "url": event_data.get('meta', {}).get('uri', ''),
-                    "user": event_data.get('user', ''),
-                    "comment": event_data.get('comment', ''),
-                    "change_size": event_data.get('length', {}).get('new', 0)
-                    - event_data.get('length', {}).get('old', 0),
-                    "timestamp": event_data.get('timestamp')
-                }
+            for msg in client.events():
+                if not msg.data:
+                    continue
+                counters["seen"] += 1
 
-                # Send to local receiver (or Cloudflare Worker later)
                 try:
-                    response = requests.post(INGEST_URL, json=payload, timeout=10)
-                    if response.ok:
-                        try:
-                            enriched = response.json()
-                            print(f"[ENRICHED:{request_id}]", enriched)
-                        except ValueError:
-                            print(f"[ENRICHED:{request_id}] (non-JSON response)")
-                    else:
-                        print(f"[ENRICHED:{request_id}] Worker responded with {response.status_code}: {response.text}")
+                    event_data = json.loads(msg.data)
+
+                    if not filter_event(event_data):
+                        counters["filtered"] += 1
+                        if counters["seen"] % LOG_EVERY_N == 0:
+                            log_summary(counters)
+                        continue
+
+                    # This is a CANDIDATE for our AI
+                    request_id = str(uuid.uuid4())
+                    payload = build_payload(event_data, request_id)
+                    if payload is None:
+                        counters["enriched_failed"] += 1
+                        print(f"[ENRICHED:{request_id}] Skipping event due to payload contract mismatch")
+                        if counters["seen"] % LOG_EVERY_N == 0:
+                            log_summary(counters)
+                        continue
+
+                    # Send to local receiver (or Cloudflare Worker later)
+                    try:
+                        post_response = requests.post(INGEST_URL, json=payload, timeout=10)
+                        if post_response.ok:
+                            counters["enriched_ok"] += 1
+                            db_inserted = None
+                            try:
+                                enriched = post_response.json()
+                                db_inserted = enriched.get("db_inserted")
+                                print(f"[ENRICHED:{request_id}]", enriched)
+                            except ValueError:
+                                print(f"[ENRICHED:{request_id}] (non-JSON response)")
+
+                            if db_inserted is True:
+                                counters["db_insert_ok"] += 1
+                            elif db_inserted is False:
+                                counters["db_insert_failed"] += 1
+                        else:
+                            counters["enriched_failed"] += 1
+                            print(f"[ENRICHED:{request_id}] Worker responded with {post_response.status_code}: {post_response.text}")
+                    except Exception as e:
+                        counters["enriched_failed"] += 1
+                        print(f"[ENRICHED:{request_id}] Error sending to ingest endpoint: {e}")
+
+                    print(f"[CANDIDATE] {payload['title']} | Change: {payload['change_size']} chars")
+                    print(f"   > Comment: {payload['comment']}\n")
+                    if counters["seen"] % LOG_EVERY_N == 0:
+                        log_summary(counters)
+
+                except json.JSONDecodeError:
+                    if counters["seen"] % LOG_EVERY_N == 0:
+                        log_summary(counters)
                 except Exception as e:
-                    print(f"[ENRICHED:{request_id}] Error sending to ingest endpoint: {e}")
+                    counters["enriched_failed"] += 1
+                    print(f"Error processing event: {e}")
+                    if counters["seen"] % LOG_EVERY_N == 0:
+                        log_summary(counters)
 
-                print(f"[CANDIDATE] {payload['title']} | Change: {payload['change_size']} chars")
-                print(f"   > Comment: {payload['comment']}\n")
-
-        except json.JSONDecodeError:
-            pass
-        except Exception as e:
-            print(f"Error processing event: {e}")
+        except requests.exceptions.RequestException as e:
+            print(f"Stream connection error: {e}. Reconnecting in {reconnect_delay_seconds}s...")
+            time.sleep(reconnect_delay_seconds)
+        finally:
+            if stream_response is not None:
+                stream_response.close()
 
 
 if __name__ == "__main__":
